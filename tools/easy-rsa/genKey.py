@@ -1,30 +1,17 @@
 import os, sys
 import pexpect
-import threading
+import logging
 import time
-import subprocess
-from bson.objectid import ObjectId
+import threading
 from pathlib import Path
-from flask import request, send_from_directory
-from flask_restx import Resource
-
-from app.main.model.database import *
-from ..util.dto import CertDto
-from ..util.response import *
-from ..config import get_config
-
-api = CertDto.api
-cert_key = CertDto.cert_key
-
-UPLOAD_DIR = Path(get_config().UPLOAD_ROOT)
 
 if os.name == 'nt':
-    EASY_RSA_PATH = Path('..') / 'easy-rsa' / 'Windows'
+    EASY_RSA_PATH = Path('..') / 'tools' / 'easy-rsa' / 'Windows'
     KEYS_PATH = EASY_RSA_PATH / 'keys'
     LINE_BEGIN = ''
     LINE_END = os.linesep * 2
 elif os.name == 'posix':
-    EASY_RSA_PATH = Path('..') / 'easy-rsa' / 'Linux'
+    EASY_RSA_PATH = Path('..') / 'tools' / 'easy-rsa' / 'Linux'
     KEYS_PATH = EASY_RSA_PATH / 'keys'
     LINE_BEGIN = './'
     LINE_END = os.linesep
@@ -52,20 +39,52 @@ def get_pexpect_child():
     return child
 
 class build_keys(threading.Thread):
-    def __init__(self, app):
-        threading.Thread.__init__(self)
-        self.app = app
+    def __init__(self, app=None):
+        super().__init__()
+        if app:
+            self.logger = app.logger
+        else:
+            logging.basicConfig(level=logging.DEBUG,format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',  \
+                    datefmt='%a, %d %b %Y %H:%M:%S')
+            self.logger = logging
 
     def run(self):
-        if not is_file_valid(KEYS_PATH / 'ca.key') or not is_file_valid(KEYS_PATH / 'ca.crt'):
-            self.app.logger.info('Start to build CA key')
+        if not os.path.exists(KEYS_PATH / 'index.txt') or not is_file_valid(KEYS_PATH / 'serial'):
+            self.logger.info('Clean up keys')
             start = time.time()
             child = get_pexpect_child()
             child.sendline('cd {}'.format(EASY_RSA_PATH))
             child.expect(LINE_END)
 
             if os.name == 'nt':
-                child.sendline(LINE_BEGIN + 'vars')
+                child.sendline('vars')
+            elif os.name == 'posix':
+                child.sendline('source vars')
+            child.expect(LINE_END)
+
+            if os.name == 'nt':
+                child.sendline('clean-all')
+            elif os.name == 'posix':
+                child.sendline(LINE_BEGIN + 'clean-all')
+            child.expect(LINE_END)
+
+            time.sleep(1)
+            child.kill(9)
+
+            if os.path.exists(KEYS_PATH / 'index.txt') and is_file_valid(KEYS_PATH / 'serial'):
+                self.logger.info('Succeeded to clean up keys, time consumed: {}'.format(time.time() - start))
+            else:
+                self.logger.error('Failed to clean up keys')
+
+        if not is_file_valid(KEYS_PATH / 'ca.key') or not is_file_valid(KEYS_PATH / 'ca.crt'):
+            self.logger.info('Start to build CA key')
+            start = time.time()
+            child = get_pexpect_child()
+            child.sendline('cd {}'.format(EASY_RSA_PATH))
+            child.expect(LINE_END)
+
+            if os.name == 'nt':
+                child.sendline('vars')
             elif os.name == 'posix':
                 child.sendline('source vars')
             child.expect(LINE_END)
@@ -100,19 +119,20 @@ class build_keys(threading.Thread):
             child.kill(9)
 
             if is_file_valid(KEYS_PATH / 'ca.key') and is_file_valid(KEYS_PATH / 'ca.crt'):
-                self.app.logger.info('Succeeded to build CA key, time consumed: {}'.format(time.time() - start))
+                self.logger.info('Succeeded to build CA key, time consumed: {}'.format(time.time() - start))
             else:
-                self.app.logger.error('Failed to build CA key')
+                self.logger.error('Failed to build CA key')
+                return
 
         if not is_file_valid(KEYS_PATH / 'ta.key') and os.name == 'nt':
-            self.app.logger.info('Start to build TA key')
+            self.logger.info('Start to build TA key')
             start = time.time()
             child = get_pexpect_child()
             child.sendline('cd {}'.format(EASY_RSA_PATH))
             child.expect(LINE_END)
 
             if os.name == 'nt':
-                child.sendline(LINE_BEGIN + 'vars')
+                child.sendline('vars')
             elif os.name == 'posix':
                 child.sendline('source vars')
             child.expect(LINE_END)
@@ -124,26 +144,27 @@ class build_keys(threading.Thread):
             child.kill(9)
 
             if is_file_valid(KEYS_PATH / 'ta.key'):
-                self.app.logger.info('Succeeded to build TA key, time consumed: {}'.format(time.time() - start))
+                self.logger.info('Succeeded to build TA key, time consumed: {}'.format(time.time() - start))
             else:
-                self.app.logger.error('Failed to build TA key')
+                self.logger.error('Failed to build TA key')
 
         if not is_file_valid(KEYS_PATH / 'server.key') or not is_file_valid(KEYS_PATH / 'server.crt'):
-            self.app.logger.info('Start to build server key')
+            self.logger.info('Start to build server key')
             start = time.time()
             child = get_pexpect_child()
             child.sendline('cd {}'.format(EASY_RSA_PATH))
             child.expect(LINE_END)
 
             if os.name == 'nt':
-                child.sendline(LINE_BEGIN + 'vars')
+                child.sendline('vars')
             elif os.name == 'posix':
                 child.sendline('source vars')
             child.expect(LINE_END)
 
             child.sendline(LINE_BEGIN + 'build-key-server server')
             child.expect(']:', timeout=30)  # Country Name
-            child.send('\n')
+            #child.send('\n')
+            child.sendline()
 
             child.expect(']:')  # State or Province Name
             child.sendline()
@@ -167,18 +188,25 @@ class build_keys(threading.Thread):
             child.sendline()
 
             child.expect(']:')  # A challenge password
-            child.send('\n')    # don't know why only '\n' works
+            #child.send('\n')    # don't know why only '\n' works
+            child.sendline()
 
             child.expect(']:')  # An optional company name
             child.sendline()
 
-            child.expect(r'\[y/n\]:')
+            try:
+                child.expect(r'\[y/n\]:', timeout=2)
+            except pexpect.exceptions.TIMEOUT:
+                self.logger.error(child.before.decode())
+                child.kill(9)
+                return
             child.sendline('y')
 
             try:
                 child.expect('\[y/n\]', timeout=2)
             except pexpect.exceptions.TIMEOUT:
-                self.app.logger.warning('Signing certificate failed possibly due to repeated CSR requests')
+                self.logger.error(child.before.decode())
+                self.logger.error('Signing certificate failed possibly due to repeated CSR requests')
             child.sendline('y')
 
             child.expect(LINE_END, timeout=30)
@@ -187,19 +215,19 @@ class build_keys(threading.Thread):
             child.kill(9)
 
             if is_file_valid(KEYS_PATH / 'server.key') and is_file_valid(KEYS_PATH / 'server.crt'):
-                self.app.logger.info('Succeeded to build server key, time consumed: {}'.format(time.time() - start))
+                self.logger.info('Succeeded to build server key, time consumed: {}'.format(time.time() - start))
             else:
-                self.app.logger.error('Failed to build server key')
+                self.logger.error('Failed to build server key')
 
         if not is_file_valid(KEYS_PATH / 'dh2048.pem'):
-            self.app.logger.info('Start to build DH key')
+            self.logger.info('Start to build DH key')
             start = time.time()
             child = get_pexpect_child()
             child.sendline('cd {}'.format(EASY_RSA_PATH))
             child.expect(LINE_END)
 
             if os.name == 'nt':
-                child.sendline(LINE_BEGIN + 'vars')
+                child.sendline('vars')
             elif os.name == 'posix':
                 child.sendline('source vars')
             child.expect(LINE_END)
@@ -211,69 +239,16 @@ class build_keys(threading.Thread):
             child.kill(9)
 
             if is_file_valid(KEYS_PATH / 'dh2048.pem'):
-                self.app.logger.info('Succeeded to build DH key, time consumed: {}'.format(time.time() - start))
+                self.logger.info('Succeeded to build DH key, time consumed: {}'.format(time.time() - start))
             else:
-                self.app.logger.error('Failed to build DH key')
+                self.logger.error('Failed to build DH key')
 
-def build_easyrsa_keys(app):
-    thread = build_keys(app)
+def build_easyrsa_keys():
+    thread = build_keys()
     thread.daemon = True
     thread.start()
 
-@api.route('/csr')
-class certificate_signing_request(Resource):
-    @api.doc('certificate signing request')
-    def post(self):
-        """
-        Certificate signing request
-        """
-        filename = None
-        for name, file in request.files.items():
-            if file.filename.endswith('.csr'):
-                temp_id = str(ObjectId())
-                filename = KEYS_PATH / (temp_id + '.csr')
-                # file.save(str(filename))
-                file.save(str(filename))
-                break
-
-        if filename:
-            child = get_pexpect_child()
-            child.sendline('cd {}'.format(EASY_RSA_PATH))
-            child.expect(LINE_END)
-
-            if os.name == 'nt':
-                child.sendline(LINE_BEGIN + 'vars')
-            elif os.name == 'posix':
-                child.sendline('source vars')
-            child.expect(LINE_END)
-
-            if not is_file_valid(KEYS_PATH / 'ca.key'):
-                return 'CA not found', 404
-
-            cert_name = os.path.basename(filename).split('.')[0]
-            child.sendline(LINE_BEGIN + 'sign-req {}'.format(cert_name))
-            child.expect(r'\[y/n\]:')
-            child.sendline('y')
-
-            try:
-                child.expect('\[y/n\]', timeout=2)
-            except pexpect.exceptions.TIMEOUT:
-                return 'Signing certificate failed possibly due to repeated CSR requests', 404
-            child.sendline('y')
-
-            child.expect(LINE_END)
-
-            return send_from_directory(Path(os.getcwd()) / os.path.dirname(filename), cert_name + '.crt')
-        return 'CSR request is invalid', 404
-
-@api.route('/ca')
-class certificate_authority_request(Resource):
-    @api.doc('certificate authority request')
-    def get(self):
-        """
-        Certificate authority request
-        """
-        if not is_file_valid(KEYS_PATH / 'ca.key'):
-            return 'CA not found', 404
-
-        return send_from_directory(Path(os.getcwd()) / KEYS_PATH, 'ca.crt')
+if __name__ == '__main__':
+    thread = build_keys()
+    thread.start()
+    thread.join()
